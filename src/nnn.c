@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2014-2016, Lazaros Koromilas <lostd@2f30.org>
  * Copyright (C) 2014-2016, Dimitris Papastamos <sin@2f30.org>
- * Copyright (C) 2016-2023, Arun Prakash Jana <engineerarun@gmail.com>
+ * Copyright (C) 2016-2024, Arun Prakash Jana <engineerarun@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -148,7 +148,7 @@
 #endif
 
 /* Macro definitions */
-#define VERSION      "4.9"
+#define VERSION      "5.0"
 #define GENERAL_INFO "BSD 2-Clause\nhttps://github.com/jarun/nnn"
 
 #ifndef NOSSN
@@ -192,6 +192,8 @@
 #define MSGWAIT         '$'
 #define SELECT          ' '
 #define PROMPT          ">>> "
+#undef NEWLINE
+#define NEWLINE         "\n"
 #define REGEX_MAX       48
 #define ENTRY_INCR      64 /* Number of dir 'entry' structures to allocate per shot */
 #define NAMEBUF_INCR    0x800 /* 64 dir entries at once, avg. 32 chars per file name = 64*32B = 2KB */
@@ -603,7 +605,7 @@ static char * const utils[] = {
 #define MSG_SSN_NAME     6
 #define MSG_CP_MV_AS     7
 #define MSG_CUR_SEL_OPTS 8
-#define MSG_FORCE_RM     9
+#define MSG_FILE_LIMIT   9
 #define MSG_SIZE_LIMIT   10
 #define MSG_NEW_OPTS     11
 #define MSG_CLI_MODE     12
@@ -638,7 +640,6 @@ static char * const utils[] = {
 #define MSG_NOCHANGE     41
 #define MSG_DIR_CHANGED  42
 #define MSG_BM_NAME      43
-#define MSG_FILE_LIMIT   44
 
 static const char * const messages[] = {
 	"",
@@ -650,7 +651,7 @@ static const char * const messages[] = {
 	"session name: ",
 	"'c'p/'m'v as?",
 	"'c'urrent/'s'el?",
-	"%s %s? [Esc cancels]",
+	"file limit exceeded",
 	"size limit exceeded",
 	"['f'ile]/'d'ir/'s'ym/'h'ard?",
 	"['g'ui]/'c'li?",
@@ -685,7 +686,6 @@ static const char * const messages[] = {
 	"unchanged",
 	"dir changed, range sel off",
 	"name: ",
-	"file limit exceeded",
 };
 
 /* Supported configuration environment variables */
@@ -1423,7 +1423,7 @@ static int create_tmp_file(void)
 
 static void msg(const char *message)
 {
-	dprintf(STDERR_FILENO, "%s\n", message);
+	fprintf(stderr, "%s\n", message);
 }
 
 #ifdef KEY_RESIZE
@@ -1553,19 +1553,24 @@ static void xdelay(useconds_t delay)
 
 static char confirm_force(bool selection, bool use_trash)
 {
-	char str[64];
+	char str[300];
 
 	/* Note: ideally we should use utils[UTIL_RM_RF] instead of the "rm -rf" string */
-	snprintf(str, 64, messages[MSG_FORCE_RM],
-		 use_trash ? utils[UTIL_GIO_TRASH] + 4 : "rm -rf",
-		 (selection ? "selected" : "hovered"));
+	int r = snprintf(str, 20, "%s", use_trash ? utils[UTIL_GIO_TRASH] + 4 : "rm -rf");
 
-	int r = get_input(str);
+	if (selection)
+		snprintf(str + r, 280, " %d files?", nselected);
+	else
+		snprintf(str + r, 280, " '%s'?", pdents[cur].name);
+
+	r = get_input(str);
 
 	if (r == ESC)
 		return '\0'; /* cancel */
 	if (r == 'y' || r == 'Y')
 		return 'f'; /* forceful for rm */
+	if (r == 'n' || r == 'N')
+		return '\0'; /* cancel */
 	return (use_trash ? '\0' : 'i'); /* interactive for rm */
 }
 
@@ -1608,7 +1613,7 @@ static void selbufrealloc(const size_t alloclen)
 }
 
 /* Write selected file paths to fd, linefeed separated */
-static size_t seltofile(int fd, uint_t *pcount)
+static size_t seltofile(int fd, uint_t *pcount, const char *separator)
 {
 	uint_t lastpos, count = 0;
 	char *pbuf = pselbuf;
@@ -1644,7 +1649,7 @@ static size_t seltofile(int fd, uint_t *pcount)
 
 		pos += len;
 		if (pos <= lastpos) {
-			if (write(fd, "\n", 1) != 1)
+			if (write(fd, separator, 1) != 1)
 				return pos;
 			pbuf += len + 1;
 		}
@@ -1969,7 +1974,7 @@ static void endselection(bool endselmode)
 		return;
 	}
 
-	seltofile(fd, NULL);
+	seltofile(fd, NULL, NEWLINE);
 	if (close(fd)) {
 		DPRINTF_S(strerror(errno));
 		printwarn(NULL);
@@ -2033,7 +2038,7 @@ static int editselection(void)
 		return -1;
 	}
 
-	seltofile(fd, NULL);
+	seltofile(fd, NULL, NEWLINE);
 	if (close(fd)) {
 		DPRINTF_S(strerror(errno));
 		return -1;
@@ -2558,7 +2563,7 @@ static bool rmmulstr(char *buf, bool use_trash)
 		return FALSE;
 
 	if (!use_trash)
-		snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c 'rm -%cr -- \"$0\" \"$@\" < /dev/tty' < %s",
+		snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c 'rm -%cvr -- \"$0\" \"$@\" < /dev/tty' < %s",
 			 r, selpath);
 	else
 		snprintf(buf, CMD_LEN_MAX, "xargs -0 %s < %s",
@@ -2575,9 +2580,9 @@ static bool xrm(char * const fpath, bool use_trash)
 		return FALSE;
 
 	if (!use_trash) {
-		char rm_opts[] = "-ir";
+		char rm_opts[5] = "-vr\0";
 
-		rm_opts[1] = r;
+		rm_opts[3] = r;
 		spawn("rm", rm_opts, "--", fpath, F_NORMAL | F_CHKRTN);
 	} else
 		spawn(utils[(g_state.trash == 1) ? UTIL_TRASH_CLI : UTIL_GIO_TRASH],
@@ -2641,7 +2646,7 @@ static bool cpmv_rename(int choice, const char *path)
 		if (!count)
 			goto finish;
 	} else
-		seltofile(fd, &count);
+		seltofile(fd, &count, NEWLINE);
 
 	close(fd);
 
@@ -2761,8 +2766,8 @@ static bool batch_rename(void)
 		for (i = 0; i < ndents; ++i)
 			appendfpath(pdents[i].name, NAME_MAX);
 
-	seltofile(fd1, &count);
-	seltofile(fd2, NULL);
+	seltofile(fd1, &count, NEWLINE);
+	seltofile(fd2, NULL, NEWLINE);
 	close(fd2);
 
 	if (dir) /* Don't retain dir entries in selection */
@@ -2843,7 +2848,11 @@ static void write_lastdir(const char *curpath, const char *outfile)
 			: cfgpath, O_CREAT | O_WRONLY | O_TRUNC, S_IWUSR | S_IRUSR);
 
 	if (fd != -1 && shell_escape(g_buf, sizeof(g_buf), curpath)) {
-		dprintf(fd, "cd %s", g_buf);
+		if (write(fd, "cd ", 3) == 3) {
+			if (write(fd, g_buf, strlen(g_buf)) != (ssize_t)strlen(g_buf)) {
+				DPRINTF_S("write failed!");
+			}
+		}
 		close(fd);
 	}
 }
@@ -6067,7 +6076,7 @@ static void send_to_explorer(int *presel)
 {
 	if (nselected) {
 		int fd = open(fifopath, O_WRONLY|O_NONBLOCK|O_CLOEXEC, 0600);
-		if ((fd == -1) || (seltofile(fd, NULL) != (size_t)(selbufpos)))
+		if ((fd == -1) || (seltofile(fd, NULL, NEWLINE) != (size_t)(selbufpos)))
 			printwarn(presel);
 		else {
 			resetselind();
@@ -8357,7 +8366,7 @@ static void check_key_collision(void)
 		key = bindings[i].sym;
 
 		if (bitmap[key])
-			dprintf(STDERR_FILENO, "key collision! [%s]\n", keyname(key));
+			fprintf(stderr, "key collision! [%s]\n", keyname(key));
 		else
 			bitmap[key] = TRUE;
 	}
@@ -8365,7 +8374,7 @@ static void check_key_collision(void)
 
 static void usage(void)
 {
-	dprintf(STDOUT_FILENO,
+	fprintf(stdout,
 		"%s: nnn [OPTIONS] [PATH]\n\n"
 		"The unorthodox terminal file manager.\n\n"
 		"positional args:\n"
@@ -8419,6 +8428,7 @@ static void usage(void)
 #ifndef NOX11
 		" -x      notis, selection sync, xterm title\n"
 #endif
+		" -0      null separator in picker mode\n"
 		" -h      show help\n\n"
 		"v%s\n%s\n", __func__, VERSION, GENERAL_INFO);
 }
@@ -8559,6 +8569,7 @@ int main(int argc, char *argv[])
 	char *arg = NULL;
 	char *session = NULL;
 	int fd, opt, sort = 0, pkey = '\0'; /* Plugin key */
+	bool sepnul = FALSE;
 #ifndef NOMOUSE
 	mmask_t mask;
 	char *middle_click_env = xgetenv(env_cfg[NNN_MCLICK], "\0");
@@ -8576,7 +8587,7 @@ int main(int argc, char *argv[])
 
 	while ((opt = (env_opts_id > 0
 		       ? env_opts[--env_opts_id]
-		       : getopt(argc, argv, "aAb:BcCdDeEfF:gHiJKl:nNop:P:QrRs:St:T:uUVxh"))) != -1) {
+		       : getopt(argc, argv, "aAb:BcCdDeEfF:gHiJKl:nNop:P:QrRs:St:T:uUVx0h"))) != -1) {
 		switch (opt) {
 #ifndef NOFIFO
 		case 'a':
@@ -8716,10 +8727,13 @@ int main(int argc, char *argv[])
 			g_state.uidgid = 1;
 			break;
 		case 'V':
-			dprintf(STDOUT_FILENO, "%s\n", VERSION);
+			fprintf(stdout, "%s\n", VERSION);
 			return EXIT_SUCCESS;
 		case 'x':
 			cfg.x11 = 1;
+			break;
+		case '0':
+			sepnul = TRUE;
 			break;
 		case 'h':
 			usage();
@@ -9038,7 +9052,7 @@ int main(int argc, char *argv[])
 	if (g_state.picker) {
 		if (selbufpos) {
 			fd = selpath ? open(selpath, O_WRONLY | O_CREAT | O_TRUNC, 0600) : STDOUT_FILENO;
-			if ((fd == -1) || (seltofile(fd, NULL) != (size_t)(selbufpos)))
+			if ((fd == -1) || (seltofile(fd, NULL, sepnul ? "\0" : NEWLINE) != (size_t)(selbufpos)))
 				xerror();
 
 			if (fd > 1)
